@@ -187,6 +187,9 @@ add_polly_library(Polly
   Transform/DeadCodeElimination.cpp
   Transform/IndependentBlocks.cpp
   Transform/ScheduleOptimizer.cpp
+  OptParser/lex.yy.c
+  OptParser/y.tab.c
+  Transform/PiecewiseAffineTransform.cpp
   ${ISL_FILES}
   )
 

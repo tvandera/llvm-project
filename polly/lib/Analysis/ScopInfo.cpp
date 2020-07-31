@@ -24,6 +24,7 @@
 #include "polly/Support/SCEVValidator.h"
 #include "polly/Support/ScopHelper.h"
 #include "polly/TempScopInfo.h"
+#include "polly/Support/GICHelper.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -1696,6 +1697,7 @@ void Scop::dropConstantScheduleDims() {
     Schedule = isl_map_apply_range(Schedule, isl_map_copy(DropDimMap));
     Stmt.setSchedule(Schedule);
   }
+  
   isl_set_free(ScheduleSpace);
   isl_map_free(DropDimMap);
 }
@@ -1712,22 +1714,43 @@ Scop::Scop(TempScop &tempScop, LoopInfo &LI, ScalarEvolution &ScalarEvolution,
   SmallVector<unsigned, 8> Schedule;
 
   Schedule.assign(MaxLoopDepth + 1, 0);
-
+  std::map<const Region *, isl_set *> RegionDomainMap;
+  std::map<const Region *, unsigned> RegionDimMap;
+          
   // Build the iteration domain, access functions and schedule functions
   // traversing the region tree.
-  buildScop(tempScop, getRegion(), NestLoops, Schedule, LI, SD);
+  buildScop(tempScop, getRegion(), NestLoops, Schedule, LI, SD, RegionDomainMap, RegionDimMap);
+
+  auto itr = RegionDomainMap.begin();
+  while (itr != RegionDomainMap.end()) {
+    Loop *L = castToLoop(*itr->first, LI);
+    if(!L){
+        isl_set_free(itr->second);
+    }
+    else {
+        LoopDomainMap[itr->first->getEntry()->getName().str()] = itr->second;
+	LoopDimMap[itr->first->getEntry()->getName().str()] = RegionDimMap[itr->first];
+    }
+    ++itr;
+  } 
+
+
 
   realignParams();
   addParameterBounds();
   simplifyAssumedContext();
-  dropConstantScheduleDims();
-
+  // dropConstantScheduleDims();
+  
+  // remove Non-Loop Regions
   assert(NestLoops.empty() && "NestLoops not empty at top level!");
 }
 
 Scop::~Scop() {
   isl_set_free(Context);
   isl_set_free(AssumedContext);
+  for (const auto &It : LoopDomainMap) {
+      isl_set_free(It.second);
+  }
 
   // Free the alias groups
   for (MinMaxVectorTy *MinMaxAccesses : MinMaxAliasGroups) {
@@ -1846,6 +1869,15 @@ void Scop::printArrayInfo(raw_ostream &OS) const {
   OS.indent(4) << "}\n";
 }
 
+void Scop::printLoopDomainMap(raw_ostream &OS) const {
+  OS << "Loop Domain Map {\n";
+
+  for (auto &Loop : LoopDomainMap)
+    OS.indent(8) << Loop.first << ": "<< stringFromIslObj(Loop.second) << "\n";
+
+  OS.indent(4) << "}\n";
+}
+
 void Scop::print(raw_ostream &OS) const {
   OS.indent(4) << "Function: " << getRegion().getEntry()->getParent()->getName()
                << "\n";
@@ -1855,6 +1887,7 @@ void Scop::print(raw_ostream &OS) const {
   printArrayInfo(OS.indent(4));
   printAliasAssumptions(OS);
   printStatements(OS.indent(4));
+  printLoopDomainMap(OS.indent(4));
 }
 
 void Scop::dump() const { print(dbgs()); }
@@ -2008,25 +2041,38 @@ void Scop::addScopStmt(BasicBlock *BB, Region *R, TempScop &tempScop,
 void Scop::buildScop(TempScop &tempScop, const Region &CurRegion,
                      SmallVectorImpl<Loop *> &NestLoops,
                      SmallVectorImpl<unsigned> &ScheduleVec, LoopInfo &LI,
-                     ScopDetection &SD) {
-  if (SD.isNonAffineSubRegion(&CurRegion, &getRegion()))
-    return addScopStmt(nullptr, const_cast<Region *>(&CurRegion), tempScop,
+                     ScopDetection &SD, std::map<const Region *, isl_set *> &RegionDomainMap, std::map<const Region *, unsigned> &RegionDimMap) {
+  isl_set *RegionDomain = isl_set_empty(isl_space_set_alloc(getIslCtx(), 0, getMaxLoopDepth() * 2 + 1));
+
+ if (SD.isNonAffineSubRegion(&CurRegion, &getRegion())) {
+    addScopStmt(nullptr, const_cast<Region *>(&CurRegion), tempScop,
                        CurRegion, NestLoops, ScheduleVec);
+    // TODO add region to RegionDomainMap
+    BasicBlock *BB = CurRegion.getEntry();
+    RegionDomain = isl_set_union(RegionDomain, isl_map_range(getStmtForBasicBlock(BB)->getSchedule()));
+    //setSchedule(&CurRegion, RegionDomain);
+    RegionDomainMap[&CurRegion] = RegionDomain;
+    return;
+  } 
 
   Loop *L = castToLoop(CurRegion, LI);
 
-  if (L)
+  if (L){
     NestLoops.push_back(L);
+  }
 
   unsigned loopDepth = NestLoops.size();
   assert(ScheduleVec.size() > loopDepth && "Schedule not big enough!");
-
+      
   for (Region::const_element_iterator I = CurRegion.element_begin(),
                                       E = CurRegion.element_end();
        I != E; ++I)
     if (I->isSubRegion()) {
       buildScop(tempScop, *I->getNodeAs<Region>(), NestLoops, ScheduleVec, LI,
-                SD);
+                SD, RegionDomainMap, RegionDimMap);
+      // getSchedule(I->getNodeAs<Region>());
+      RegionDomain = isl_set_union(RegionDomain, isl_set_copy(RegionDomainMap[I->getNodeAs<Region>()]));
+
     } else {
       BasicBlock *BB = I->getNodeAs<BasicBlock>();
 
@@ -2034,12 +2080,18 @@ void Scop::buildScop(TempScop &tempScop, const Region &CurRegion,
         continue;
 
       addScopStmt(BB, nullptr, tempScop, CurRegion, NestLoops, ScheduleVec);
+      RegionDomain = isl_set_union(RegionDomain, isl_map_range(getStmtForBasicBlock(BB)->getSchedule()));
     }
 
+  RegionDomain = isl_set_coalesce(RegionDomain);
+  //setSchedule(&CurRegion, RegionDomain);
+  RegionDomainMap[&CurRegion] = RegionDomain;
+  
   if (!L)
     return;
 
-  // Exiting a loop region.
+ // Exiting a loop region.
+  RegionDimMap[&CurRegion] = loopDepth;
   ScheduleVec[loopDepth] = 0;
   NestLoops.pop_back();
   ++ScheduleVec[loopDepth - 1];

@@ -23,6 +23,7 @@
 #include "polly/ScopDetection.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Analysis/RegionPass.h"
+#include "llvm/IR/Metadata.h"
 #include "isl/ctx.h"
 
 #include <forward_list>
@@ -38,6 +39,7 @@ class ScalarEvolution;
 class SCEV;
 class SCEVAddRecExpr;
 class Type;
+class MDNode;
 }
 
 struct isl_ctx;
@@ -750,6 +752,12 @@ public:
   /// @brief Vector of minimal/maximal access vectors one for each alias group.
   using MinMaxVectorVectorTy = SmallVector<MinMaxVectorTy *, 4>;
 
+  /// Maps each region in the function to the domain of statements within the region
+  std::map<const std::string, isl_set *> LoopDomainMap;
+
+  /// Maps each region in the function to the loop Depth within the region
+  std::map<const std::string, unsigned> LoopDimMap;
+
 private:
   Scop(const Scop &) = delete;
   const Scop &operator=(const Scop &) = delete;
@@ -861,7 +869,7 @@ private:
                  SmallVectorImpl<Loop *> &NestLoops,
                  // The schedule numbers
                  SmallVectorImpl<unsigned> &Schedule, LoopInfo &LI,
-                 ScopDetection &SD);
+                 ScopDetection &SD, std::map<const Region *, isl_set *> &RegionDomainMap, std::map<const Region *, unsigned> &RegionDimMap );
 
   /// @name Helper function for printing the Scop.
   ///
@@ -870,6 +878,7 @@ private:
   void printArrayInfo(raw_ostream &OS) const;
   void printStatements(raw_ostream &OS) const;
   void printAliasAssumptions(raw_ostream &OS) const;
+  void printLoopDomainMap(raw_ostream &OS) const;
   ///}
 
   friend class ScopInfo;
